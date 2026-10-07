@@ -1,0 +1,7 @@
+name: cf-automerge
+channels:
+  - conda-forge
+dependencies:
+  - python
+  - gh
+  - ruamel.yaml
