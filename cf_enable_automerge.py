@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""Turn bot automerge on/off for every conda-forge feedstock you maintain.
+"""Turn conda-forge bot automerge on/off for every feedstock you maintain.
 
-Finds feedstocks via your conda-forge team memberships (each feedstock has a
-team synced from recipe-maintainers), scans conda-forge.yml in each, prints a
-summary, then (after confirmation) commits the change straight to the default
-branch with [ci skip] so no builds fire.
+Automerge is only enabled on feedstocks that are safe for it:
+  1. the recipe runs upstream tests (pytest, ctest, make check, ...), not just
+     import checks, so a green CI actually means something
+  2. the bot updates dependencies itself (bot.inspection: update-grayskull or
+     update-all), so version bumps don't merge with stale requirements
+
+Finds feedstocks via your conda-forge team memberships, scans each, prints a
+summary, then (after confirmation) commits the conda-forge.yml change straight
+to the default branch with [ci skip] so no builds fire.
 
 Requires: gh (authed, with read:org scope), ruamel.yaml
 Usage:
-    python cf_enable_automerge.py --dry-run          # scan + summary + diffs, change nothing
-    python cf_enable_automerge.py                    # automerge: true
-    python cf_enable_automerge.py --mode version     # only version-bump PRs
-    python cf_enable_automerge.py --mode off         # remove automerge everywhere
-    python cf_enable_automerge.py --only foo-feedstock bar-feedstock
-    python cf_enable_automerge.py -y                 # skip confirmation prompt
+    python3 cf_enable_automerge.py --dry-run          # scan + summary + diffs
+    python3 cf_enable_automerge.py                    # automerge: true
+    python3 cf_enable_automerge.py --mode version     # only version-bump PRs
+    python3 cf_enable_automerge.py --mode off         # remove automerge
+    python3 cf_enable_automerge.py --only foo-feedstock bar-feedstock
+    python3 cf_enable_automerge.py --no-checks        # skip safety checks
 """
 import argparse
 import base64
 import difflib
 import json
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -31,7 +37,25 @@ from ruamel.yaml.comments import CommentedMap
 ORG = "conda-forge"
 CFG = "conda-forge.yml"
 OFF = object()  # sentinel: remove the key
+DEP_UPDATE_MODES = ("update-grayskull", "update-all")
 
+RECIPE_FILES = ("meta.yaml", "recipe.yaml")
+SCRIPT_EXT = (".py", ".sh", ".bat", ".R", ".r", ".pl")
+RUNNERS = [
+    ("pytest", r"\bpy\.?test\b"),
+    ("unittest", r"\bunittest\b"),
+    ("nose", r"\bnosetests\b"),
+    ("ctest", r"\bctest\b"),
+    ("make check", r"\b(?:make|ninja)\s+(?:check|test)\b"),
+    ("meson test", r"\bmeson\s+test\b"),
+    ("cargo test", r"\bcargo\s+test\b"),
+    ("go test", r"\bgo\s+test\b"),
+    ("R tests", r"\bR\s+CMD\s+check\b|\btestthat\b|\btest_check\b"),
+    ("pkg.test()", r"\b\w+\.test\("),
+]
+
+
+# ---------- github ----------
 
 def gh(*args, stdin=None, lines=False):
     r = subprocess.run(["gh", "api", *args], capture_output=True, text=True, input=stdin)
@@ -40,6 +64,11 @@ def gh(*args, stdin=None, lines=False):
     if lines:
         return [l for l in r.stdout.splitlines() if l.strip()]
     return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def get_file(repo, path):
+    d = gh(f"/repos/{ORG}/{repo}/contents/{path}")
+    return base64.b64decode(d["content"]).decode(errors="replace"), d["sha"]
 
 
 def my_feedstocks():
@@ -54,6 +83,60 @@ def my_feedstocks():
     return sorted(repos)
 
 
+# ---------- upstream test detection ----------
+
+def strip_comment(line):
+    return re.sub(r"(^|\s)#.*$", "", line)
+
+
+def command_lines(recipe_text):
+    """Lines under `commands:` (meta.yaml) or `script:` (recipe.yaml) keys."""
+    lines, out, i = recipe_text.splitlines(), [], 0
+    while i < len(lines):
+        m = re.match(r"^\s*(?:-\s+)?(commands|script)\s*:\s*(.*)$", lines[i])
+        if not m:
+            i += 1
+            continue
+        ind = m.start(1)
+        if m.group(2) and not m.group(2).startswith(("|", ">")):
+            out.append(m.group(2))
+        i += 1
+        while i < len(lines):
+            l = lines[i]
+            if not l.strip():
+                i += 1
+                continue
+            li = len(l) - len(l.lstrip())
+            if li > ind or (li == ind and l.lstrip().startswith("- ")):
+                out.append(l)
+                i += 1
+            else:
+                break
+    return out
+
+
+def find_runners(text):
+    text = "\n".join(strip_comment(l) for l in text.splitlines())
+    return {name for name, rx in RUNNERS if re.search(rx, text)}
+
+
+def upstream_tests(repo):
+    """Set of test runners found in the recipe (empty = imports-only / none)."""
+    listing = gh(f"/repos/{ORG}/{repo}/contents/recipe")
+    found = set()
+    for f in listing:
+        n = f["name"]
+        if f["type"] != "file":
+            continue
+        if n in RECIPE_FILES:
+            found |= find_runners("\n".join(command_lines(get_file(repo, f"recipe/{n}")[0])))
+        elif n.startswith(("run_test", "test")) and n.endswith(SCRIPT_EXT):
+            found |= find_runners(get_file(repo, f"recipe/{n}")[0])
+    return found
+
+
+# ---------- conda-forge.yml ----------
+
 def yaml_rt():
     y = YAML()
     y.preserve_quotes = True
@@ -67,41 +150,55 @@ def show(v):
 
 
 def patch(text, mode):
-    """Return (current_value, new_text). new_text is None if no change needed."""
+    """Return (current_automerge, inspection, new_text). new_text None = no change."""
     y = yaml_rt()
     data = (y.load(text) if text.strip() else None) or CommentedMap()
     bot = data.get("bot")
     current = bot.get("automerge") if bot else None
+    inspection = bot.get("inspection") if bot else None
 
     if mode is OFF:
         if current in (None, False):
-            return current, None
+            return current, inspection, None
         del bot["automerge"]
         if not bot:
             del data["bot"]
     else:
         if current == mode:
-            return current, None
+            return current, inspection, None
         if bot is None:
             bot = data["bot"] = CommentedMap()
         bot["automerge"] = mode
 
     buf = StringIO()
     y.dump(data, buf)
-    return current, buf.getvalue()
+    return current, inspection, buf.getvalue()
 
 
-def scan(repo, mode):
+# ---------- main flow ----------
+
+def scan(repo, mode, checks):
     path = f"/repos/{ORG}/{repo}/contents/{CFG}"
     try:
-        cur = gh(path)
-        old, sha = base64.b64decode(cur["content"]).decode(), cur["sha"]
-    except RuntimeError as e:
-        if "404" not in str(e):
-            return dict(repo=repo, error=str(e))
-        old, sha = "", None
-    current, new = patch(old, mode)
-    return dict(repo=repo, path=path, old=old, new=new, sha=sha, current=current)
+        try:
+            old, sha = get_file(repo, CFG)
+        except RuntimeError as e:
+            if "404" not in str(e):
+                raise
+            old, sha = "", None
+        current, inspection, new = patch(old, mode)
+        r = dict(repo=repo, path=path, old=old, new=new, sha=sha, current=current,
+                 inspection=inspection, deps_ok=inspection in DEP_UPDATE_MODES,
+                 runners=None, problems=[])
+        if checks:
+            r["runners"] = upstream_tests(repo)
+            if not r["runners"]:
+                r["problems"].append("no upstream tests")
+            if not r["deps_ok"]:
+                r["problems"].append("bot doesn't update deps")
+        return r
+    except Exception as e:
+        return dict(repo=repo, error=str(e))
 
 
 def apply(r, msg):
@@ -118,39 +215,77 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="show diffs, change nothing")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask before pushing")
     p.add_argument("--only", nargs="+", metavar="FEEDSTOCK", help="limit to these repos")
+    p.add_argument("--no-checks", action="store_true",
+                   help="enable automerge even without upstream tests / dep updates")
     p.add_argument("-j", "--jobs", type=int, default=8, help="parallel scans (default 8)")
     a = p.parse_args()
     mode = {"true": True, "off": OFF}.get(a.mode, a.mode)
     target = "off" if mode is OFF else show(mode)
-    msg = (f"Disable bot automerge" if mode is OFF else f"Set bot automerge: {target}") \
+    msg = ("Disable bot automerge" if mode is OFF else f"Set bot automerge: {target}") \
         + " [ci skip] ***NO_CI***"
+    checks = not a.no_checks
 
     print("Finding your feedstocks...", flush=True)
     repos = a.only or my_feedstocks()
     print(f"Scanning {len(repos)} feedstocks...\n", flush=True)
     with ThreadPoolExecutor(a.jobs) as ex:
-        results = list(ex.map(lambda r: scan(r, mode), repos))
+        results = list(ex.map(lambda r: scan(r, mode, checks), repos))
 
     errors = [r for r in results if "error" in r]
     ok = [r for r in results if "error" not in r]
-    todo = [r for r in ok if r["new"] is not None]
 
+    # gate: don't enable automerge where checks fail
+    skipped = []
+    if mode is not OFF and checks:
+        for r in ok:
+            if r["new"] is not None and r["problems"]:
+                r["new"], r["skipped"] = None, True
+                skipped.append(r)
+    todo = [r for r in ok if r["new"] is not None]
+    unsafe_on = [r for r in ok if checks and r["problems"]
+                 and r["current"] not in (None, False) and not (mode is OFF and r["new"])]
+
+    w = max([len(r["repo"]) for r in results] + [10]) + 2
     for r in results:
         if "error" in r:
-            line = f"ERROR: {r['error']}"
+            print(f"  {r['repo']:{w}s} ERROR: {r['error']}")
+            continue
+        cur = show(r["current"])
+        if r.get("skipped"):
+            state = f"{cur}  SKIP"
         elif r["new"] is None:
-            line = f"{show(r['current'])}  (no change)"
+            state = f"{cur}  (no change)"
         else:
-            line = f"{show(r['current'])} -> {target}"
-        print(f"  {r['repo']:50s} {line}")
+            state = f"{cur} -> {target}"
+        info = ""
+        if checks:
+            tests = ", ".join(sorted(r["runners"])) or "none"
+            info = f"tests: {tests:18s} deps: {r['inspection'] or 'default'}"
+        flag = "  <- automerge ON but " + "; ".join(r["problems"]) if r in unsafe_on else ""
+        print(f"  {r['repo']:{w}s} {state:22s} {info}{flag}")
 
     current = Counter(show(r["current"]) for r in ok)
     print(f"\nYou maintain {len(repos)} feedstocks.")
-    print("  Current automerge: " + ", ".join(f"{k}={v}" for k, v in sorted(current.items())))
+    if checks:
+        print(f"  Upstream tests:        {sum(bool(r['runners']) for r in ok)} yes, "
+              f"{sum(not r['runners'] for r in ok)} no")
+        print(f"  Bot updates deps:      {sum(r['deps_ok'] for r in ok)} yes, "
+              f"{sum(not r['deps_ok'] for r in ok)} no")
+    print("  Current automerge:     " + ", ".join(f"{k}={v}" for k, v in sorted(current.items())))
     print(f"  Will change to '{target}': {len(todo)}")
-    print(f"  Already '{target}':      {len(ok) - len(todo)}")
+    if skipped:
+        print(f"  Skipped (checks fail): {len(skipped)}")
     if errors:
-        print(f"  Errors:              {len(errors)}")
+        print(f"  Errors:                {len(errors)}")
+
+    if unsafe_on:
+        print(f"\n{len(unsafe_on)} feedstock(s) have automerge ON but fail the checks. To turn it off:")
+        print("  python3 cf_enable_automerge.py --mode off --only "
+              + " ".join(r["repo"] for r in unsafe_on))
+    if skipped and any("bot doesn't update deps" in r["problems"] and r["runners"] for r in skipped):
+        print("\nTip: feedstocks with tests but no dep updates can be fixed by adding to conda-forge.yml:\n"
+              "  bot:\n    inspection: update-grayskull   # pure-python PyPI packages\n"
+              "  (or update-all), then rerun this script.")
 
     if not todo:
         print("\nNothing to do.")
@@ -174,7 +309,7 @@ def main():
             status = "done"
         except Exception as e:
             status, failed = f"ERROR: {e}", failed + 1
-        print(f"  [{i}/{len(todo)}] {r['repo']:50s} {status}")
+        print(f"  [{i}/{len(todo)}] {r['repo']:{w}s} {status}")
     print(f"\n{len(todo) - failed} updated, {failed} failed.")
     sys.exit(1 if failed or errors else 0)
 
